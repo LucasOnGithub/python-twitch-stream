@@ -1,239 +1,210 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Stream NumPy RGB frames and optional PCM audio to Twitch with FFmpeg."""
 
-"""
-This file contains the classes used to send videostreams to Twitch
-"""
-from __future__ import print_function, division
-import numpy as np
-import subprocess
-import signal
-import threading
-import sys
-try:
-    import Queue as queue
-except ImportError:
-    import queue
-import time
 import os
+import queue
+import socket
+import subprocess
+import threading
+import time
 
+import numpy as np
 import requests
 
 AUDIORATE = 44100
 
 
 class TwitchOutputStream(object):
-    """
-    Initialize a TwitchOutputStream object and starts the pipe.
-    The stream is only started on the first frame.
+    """Stream RGB video and stereo audio to Twitch.
 
-    :param twitch_stream_key:
-    :type twitch_stream_key:
-    :param width: the width of the videostream (in pixels)
-    :type width: int
-    :param height: the height of the videostream (in pixels)
-    :type height: int
-    :param fps: the number of frames per second of the videostream
-    :type fps: float
-    :param enable_audio: whether there will be sound or not
-    :type enable_audio: boolean
-    :param ffmpeg_binary: the binary to use to create a videostream
-        This is usually ffmpeg, but avconv on some (older) platforms
-    :type ffmpeg_binary: String
-    :param verbose: show ffmpeg output in stdout
-    :type verbose: boolean
+    Existing positional constructor parameters and send methods are retained.
+    Optional video_codec='h264_nvenc' enables NVIDIA hardware encoding with
+    an FFmpeg build that includes NVENC. ingest_url permits an RTMP test sink.
     """
-    def __init__(self,
-                 twitch_stream_key,
-                 width=640,
-                 height=480,
-                 fps=30.,
-                 ffmpeg_binary="ffmpeg",
-                 enable_audio=False,
-                 verbose=False):
+
+    def __init__(self, twitch_stream_key, width=640, height=480,
+                 fps=30., ffmpeg_binary="ffmpeg", enable_audio=False,
+                 verbose=False, video_codec="libx264", video_bitrate=3000,
+                 audio_bitrate=160, ingest_url=None):
         self.twitch_stream_key = twitch_stream_key
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.ffmpeg_process = None
-        self.audio_pipe = None
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = float(fps)
+        if self.width <= 0 or self.height <= 0 or self.fps <= 0:
+            raise ValueError("Width, height and fps must be positive")
+        if self.width % 2 or self.height % 2:
+            raise ValueError("H.264 video width and height must be even")
         self.ffmpeg_binary = ffmpeg_binary
         self.verbose = verbose
         self.audio_enabled = enable_audio
+        self.video_codec = video_codec
+        self.video_bitrate = int(video_bitrate)
+        self.audio_bitrate = int(audio_bitrate)
+        self.ingest_url = ingest_url
+        if self.video_bitrate <= 0 or self.audio_bitrate <= 0:
+            raise ValueError("Bitrates must be positive")
+        self.ffmpeg_process = None
+        self.audio_pipe = None  # Compatibility: audio now uses a TCP socket.
+        self._audio_listener = None
+        self._audio_connection = None
+        self.closed = False
+        self.reset()
+
+    def get_closest_ingest(self):
+        """Choose a Twitch default ingest, with a stable fallback.
+
+        The ingest API does not promise the geographically closest server.
+        Callers may override its choice using ingest_url.
+        """
+        if self.ingest_url:
+            return self.ingest_url
+        fallback = "rtmp://live.twitch.tv/app/{stream_key}"
+        template = fallback
         try:
-            self.reset()
-        except OSError:
-            print("There seems to be no %s available" % ffmpeg_binary)
-            if ffmpeg_binary == "ffmpeg":
-                print("ffmpeg can be installed using the following"
-                      "commands")
-                print("> sudo add-apt-repository "
-                      "ppa:mc3man/trusty-media")
-                print("> sudo apt-get update && "
-                      "sudo apt-get install ffmpeg")
-            sys.exit(1)
+            response = requests.get("https://ingest.twitch.tv/ingests",
+                                    timeout=8)
+            response.raise_for_status()
+            ingests = response.json().get("ingests") or []
+            candidate = next((i for i in ingests if i.get("default")),
+                             ingests[0] if ingests else None)
+            if candidate:
+                supplied = candidate.get("url_template", "")
+                if (supplied.startswith(("rtmp://", "rtmps://"))
+                        and "{stream_key}" in supplied):
+                    template = supplied
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            if self.verbose:
+                print("Twitch ingest discovery failed; using default server")
+        if self.verbose:
+            print("Selected Twitch ingest:", template.split("/app/")[0])
+        return template.replace("{stream_key}", self.twitch_stream_key)
 
     def reset(self):
-        """
-        Reset the videostream by restarting ffmpeg
-        """
-
-        if self.ffmpeg_process is not None:
-            # Close the previous stream
-            try:
-                self.ffmpeg_process.send_signal(signal.SIGINT)
-            except OSError:
-                pass
-
-        command = []
-        command.extend([
+        """Restart FFmpeg, cleaning up any previous process and audio pipe."""
+        self.close()
+        self.closed = False
+        command = [
             self.ffmpeg_binary,
-            '-loglevel', 'verbose',
-            '-y',       # overwrite previous file/stream
-            # '-re',    # native frame-rate
-            '-analyzeduration', '1',
-            '-f', 'rawvideo',
-            '-r', '%d' % self.fps,  # set a fixed frame rate
-            '-vcodec', 'rawvideo',
-            # size of one frame
-            '-s', '%dx%d' % (self.width, self.height),
-            '-pix_fmt', 'rgb24',  # The input are raw bytes
-            '-thread_queue_size', '1024',
-            '-i', '-',  # The input comes from a pipe
+            "-hide_banner", "-loglevel", "info" if self.verbose else "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-video_size", "%dx%d" % (self.width, self.height),
+            "-framerate", str(self.fps), "-i", "pipe:0",
+        ]
 
-            # Twitch needs to receive sound in their streams!
-            # '-an',            # Tells FFMPEG not to expect any audio
-        ])
         if self.audio_enabled:
-            command.extend([
-                '-ar', '%d' % AUDIORATE,
-                '-ac', '2',
-                '-f', 's16le',
-                '-thread_queue_size', '1024',
-                '-i', '/tmp/audiopipe'
-            ])
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                listener.settimeout(10)
+            except Exception:
+                listener.close()
+                raise
+            self._audio_listener = listener
+            port = listener.getsockname()[1]
+            command += [
+                "-f", "s16le", "-ar", str(AUDIORATE), "-ac", "2",
+                "-i", "tcp://127.0.0.1:%d?tcp_nodelay=1" % port,
+            ]
         else:
-            command.extend([
-                '-f', 'lavfi',
-                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'
-            ])
-        command.extend([
-            # VIDEO CODEC PARAMETERS
-            '-vcodec', 'libx264',
-            '-r', '%d' % self.fps,
-            '-b:v', '3000k',
-            '-s', '%dx%d' % (self.width, self.height),
-            '-preset', 'faster', '-tune', 'zerolatency',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            # '-force_key_frames', r'expr:gte(t,n_forced*2)',
-            '-minrate', '3000k', '-maxrate', '3000k',
-            '-bufsize', '12000k',
-            '-g', '60',     # key frame distance
-            '-keyint_min', '1',
-            # '-filter:v "setpts=0.25*PTS"'
-            # '-vsync','passthrough',
+            command += [
+                "-f", "lavfi", "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=%d" % AUDIORATE,
+            ]
 
-            # AUDIO CODEC PARAMETERS
-            '-acodec', 'libmp3lame', '-ar', '44100', '-b:a', '160k',
-            # '-bufsize', '8192k',
-            '-ac', '1',
-            # '-acodec', 'aac', '-strict', 'experimental',
-            # '-ab', '128k', '-ar', '44100', '-ac', '1',
-            # '-async','44100',
-            # '-filter_complex', 'asplit', #for audio sync?
+        gop = max(1, int(round(self.fps * 2)))
+        command += [
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", self.video_codec, "-pix_fmt", "yuv420p",
+            "-r", str(self.fps),
+            "-b:v", "%dk" % self.video_bitrate,
+            "-minrate", "%dk" % self.video_bitrate,
+            "-maxrate", "%dk" % self.video_bitrate,
+            "-bufsize", "%dk" % (self.video_bitrate * 2),
+            "-g", str(gop),
+        ]
+        if self.video_codec == "libx264":
+            command += ["-preset", "veryfast", "-tune", "zerolatency"]
+        elif self.video_codec == "h264_nvenc":
+            command += ["-preset", "p4", "-rc", "cbr"]
+        command += [
+            "-c:a", "aac", "-ar", str(AUDIORATE), "-ac", "2",
+            "-b:a", "%dk" % self.audio_bitrate,
+            "-f", "flv", self.get_closest_ingest(),
+        ]
+        try:
+            self.ffmpeg_process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=None if self.verbose else subprocess.DEVNULL,
+                stderr=None if self.verbose else subprocess.DEVNULL,
+            )
+        except Exception:
+            self.close()
+            raise
 
-            # STORE THE VIDEO PARAMETERS
-            # '-vcodec', 'libx264', '-s', '%dx%d'%(width, height),
-            # '-preset', 'libx264-fast',
-            # 'my_output_videofile2.avi'
-
-            # MAP THE STREAMS
-            # use only video from first input and only audio from second
-            '-map', '0:v', '-map', '1:a',
-
-            # NUMBER OF THREADS
-            '-threads', '2',
-
-            # STREAM TO TWITCH
-            '-f', 'flv', self.get_closest_ingest(),
-        ])
-
-        devnullpipe = subprocess.DEVNULL
-        if self.verbose:
-            devnullpipe = None
-        self.ffmpeg_process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stderr=devnullpipe,
-            stdout=devnullpipe)
+    def close(self):
+        """Stop sending, release sockets, and reap FFmpeg on all platforms."""
+        self.closed = True
+        for attr in ("_audio_connection", "_audio_listener"):
+            conn = getattr(self, attr, None)
+            if conn is not None:
+                try:
+                    conn.close()
+                finally:
+                    setattr(self, attr, None)
+        process = getattr(self, "ffmpeg_process", None)
+        if process is not None:
+            self.ffmpeg_process = None
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, type, value, traceback):
-        # sigint so avconv can clean up the stream nicely
-        self.ffmpeg_process.send_signal(signal.SIGINT)
-        # waiting doesn't work because of reasons I don't know
-        # self.pipe.wait()
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def send_video_frame(self, frame):
-        """Send frame of shape (height, width, 3)
-        with values between 0 and 1.
-        Raises an OSError when the stream is closed.
-
-        :param frame: array containing the frame.
-        :type frame: numpy array with shape (height, width, 3)
-            containing values between 0.0 and 1.0
-        """
-
-        assert frame.shape == (self.height, self.width, 3)
-
-        frame = np.clip(255*frame, 0, 255).astype('uint8')
-        try:
-            self.ffmpeg_process.stdin.write(frame.tostring())
-        except OSError:
-            # The pipe has been closed. Reraise and handle it further
-            # downstream
-            raise
+        """Write an RGB frame, shape (height, width, 3), floats in [0, 1]."""
+        if self.closed or self.ffmpeg_process is None:
+            raise OSError("Twitch video stream is closed")
+        frame = np.asarray(frame)
+        if frame.shape != (self.height, self.width, 3):
+            raise ValueError("Expected video frame shape (%d, %d, 3)" %
+                             (self.height, self.width))
+        pixels = np.clip(frame * 255, 0, 255).astype(np.uint8)
+        self.ffmpeg_process.stdin.write(pixels.tobytes())
 
     def send_audio(self, left_channel, right_channel):
-        """Add the audio samples to the stream. The left and the right
-        channel should have the same shape.
-        Raises an OSError when the stream is closed.
-
-        :param left_channel: array containing the audio signal.
-        :type left_channel: numpy array with shape (k, )
-            containing values between -1.0 and 1.0. k can be any integer
-        :param right_channel: array containing the audio signal.
-        :type right_channel: numpy array with shape (k, )
-            containing values between -1.0 and 1.0. k can be any integer
-        """
-        if self.audio_pipe is None:
-            if not os.path.exists('/tmp/audiopipe'):
-                os.mkfifo('/tmp/audiopipe')
-            self.audio_pipe = os.open('/tmp/audiopipe', os.O_WRONLY)
-
-        assert len(left_channel.shape) == 1
-        assert left_channel.shape == right_channel.shape
-
-        frame = np.column_stack((left_channel, right_channel)).flatten()
-
-        frame = np.clip(32767*frame, -32767, 32767).astype('int16')
-        try:
-            os.write(self.audio_pipe, frame.tostring())
-        except OSError:
-            # The pipe has been closed. Reraise and handle it further
-            # downstream
-            raise
-
-    def get_closest_ingest(self):
-        closest_server = requests.get(url='https://ingest.twitch.tv/api/v2/ingests').json()['ingests'][0]
-        url_template = closest_server['url_template']
-        print("Streaming to closest server: %s at %s" % (closest_server['name'],
-                                                         url_template.replace('/app/{stream_key}', '')))
-        return url_template.format(
-            stream_key=self.twitch_stream_key)
+        """Write two equally sized PCM float channels with values [-1, 1]."""
+        if not self.audio_enabled:
+            raise RuntimeError("Audio is disabled for this stream")
+        if self.closed or self.ffmpeg_process is None:
+            raise OSError("Twitch audio stream is closed")
+        left = np.asarray(left_channel)
+        right = np.asarray(right_channel)
+        if left.ndim != 1 or right.shape != left.shape:
+            raise ValueError("Audio channels must be equal one-dimensional arrays")
+        if self._audio_connection is None:
+            self._audio_connection, _ = self._audio_listener.accept()
+            self._audio_connection.settimeout(10)
+        pcm = np.column_stack((left, right))
+        pcm = np.clip(pcm * 32767, -32768, 32767).astype("<i2")
+        self._audio_connection.sendall(pcm.tobytes())
 
 
 class TwitchOutputStreamRepeater(TwitchOutputStream):
@@ -260,6 +231,8 @@ class TwitchOutputStreamRepeater(TwitchOutputStream):
             self._send_last_audio()   # Start sending the stream
 
     def _send_last_video_frame(self):
+        if self.closed:
+            return
         try:
             super(TwitchOutputStreamRepeater,
                   self).send_video_frame(self.lastframe)
@@ -273,6 +246,8 @@ class TwitchOutputStreamRepeater(TwitchOutputStream):
                             self._send_last_video_frame).start()
 
     def _send_last_audio(self):
+        if self.closed:
+            return
         try:
             super(TwitchOutputStreamRepeater,
                   self).send_audio(self.lastaudioframe_left,
@@ -347,7 +322,9 @@ class TwitchBufferedOutputStream(TwitchOutputStream):
             self.t.start()
 
     def _send_video_frame(self):
-        start_time = time.time()
+        if self.closed:
+            return
+        start_time = time.monotonic()
         try:
             frame = self.q_video.get_nowait()
             # frame[0] is frame count of the frame
@@ -388,14 +365,15 @@ class TwitchBufferedOutputStream(TwitchOutputStream):
                 # self.send_me_last_frame_again()
                 #
                 # other solution:
-                self.t = threading.Thread(
-                    target=self._send_video_frame)
+                self.t = threading.Timer(0.001, self._send_video_frame)
 
         self.t.daemon = True
         self.t.start()
 
     def _send_audio(self):
-        start_time = time.time()
+        if self.closed:
+            return
+        start_time = time.monotonic()
         try:
             _, left_audio, right_audio = self.q_audio.get_nowait()
         except IndexError:
@@ -436,8 +414,7 @@ class TwitchBufferedOutputStream(TwitchOutputStream):
                 # self.send_me_last_frame_again()
                 #
                 # other solution:
-                self.t = threading.Thread(
-                    target=self._send_audio)
+                self.t = threading.Timer(0.001, self._send_audio)
 
         self.t.daemon = True
         self.t.start()
