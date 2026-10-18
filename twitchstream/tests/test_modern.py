@@ -183,3 +183,24 @@ def test_ffmpeg_can_write_a_local_flv(tmp_path):
             image = np.full((32, 32, 3), index / 20.0, dtype=float)
             stream.send_video_frame(image)
     assert (tmp_path / "sample.flv").stat().st_size > 1000
+
+
+def test_ffmpeg_can_write_audio_and_video(tmp_path):
+    """Check the loopback PCM transport with a real FFmpeg process."""
+    import shutil
+    import time
+    from twitchstream.outputvideo import TwitchBufferedOutputStream
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is not on PATH")
+    output = tmp_path / "audio_video.flv"
+    zeros = np.zeros(4410, dtype=float)
+    with TwitchBufferedOutputStream(
+        "unused", width=32, height=32, fps=10, enable_audio=True,
+        ingest_url=str(output)
+    ) as stream:
+        for _ in range(20):
+            stream.send_video_frame(np.zeros((32, 32, 3), dtype=float))
+            stream.send_audio(zeros, zeros)
+        time.sleep(2.8)
+    assert output.exists()
+    assert output.stat().st_size > 1000
