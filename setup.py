@@ -19,14 +19,14 @@ except IOError:
 
 
 install_requires = [
-    'numpy',
+    'numpy>=1.23',
+    'requests>=2.28',
     ]
 
 tests_require = [
     'mock',
     'pytest',
     'pytest-cov',
-    'pytest-pep8',
     ]
 
 setup(
@@ -42,7 +42,7 @@ setup(
         "Intended Audience :: Other Audience",
         "License :: OSI Approved :: MIT License",
         "Natural Language :: English",
-        "Operating System :: POSIX :: Linux",
+        "Operating System :: OS Independent",
         "Programming Language :: Python :: 2.7",
         "Programming Language :: Python :: 3.4",
         "Topic :: Communications :: Chat :: Internet Relay Chat",
@@ -57,6 +57,7 @@ setup(
     include_package_data=False,
     zip_safe=False,
     install_requires=install_requires,
+    python_requires=">=3.10",
     extras_require={
         'testing': tests_require,
         },
