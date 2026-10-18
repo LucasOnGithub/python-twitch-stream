@@ -169,3 +169,17 @@ def test_twitch_ingest_uses_documented_endpoint():
                 )
     request.assert_called_once_with("https://ingest.twitch.tv/ingests",
                                     timeout=8)
+
+
+def test_ffmpeg_can_write_a_local_flv(tmp_path):
+    """Integration test for FFmpeg command construction, without Twitch."""
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is not on PATH")
+    output = str(tmp_path / "sample.flv")
+    with TwitchOutputStream("unused", width=32, height=32, fps=10,
+                            ingest_url=output) as stream:
+        for index in range(20):
+            image = np.full((32, 32, 3), index / 20.0, dtype=float)
+            stream.send_video_frame(image)
+    assert (tmp_path / "sample.flv").stat().st_size > 1000
