@@ -1,271 +1,189 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Read and send Twitch IRC chat messages with a TLS connection."""
 
-"""
-This file contains the python code used to interface with the Twitch
-chat. Twitch chat is IRC-based, so it is basically an IRC-bot, but with
-special features for Twitch, such as congestion control built in.
-"""
-from __future__ import print_function
-import time
-import socket
-import re
-import fcntl
-import os
 import errno
+import re
+import socket
+import ssl
+import time
 
 
 class TwitchChatStream(object):
-    """
-    The TwitchChatStream is used for interfacing with the Twitch chat of
-    a channel. To use this, an oauth-account (of the user chatting)
-    should be created. At the moment of writing, this can be done here:
-    https://twitchapps.com/tmi/
+    """Twitch IRC client preserving the existing public chat API.
 
-    :param username: Twitch username
-    :type username: string
-    :param oauth: oauth for logging in (see https://twitchapps.com/tmi/)
-    :type oauth: string
-    :param verbose: show all stream messages on stdout (for debugging)
-    :type verbose: boolean
+    Use a user access token with chat:read and chat:edit scopes.
     """
+
+    HOST = "irc.chat.twitch.tv"
+    PORT = 6697
+    _MESSAGE = re.compile(
+        r"^(?:@[^ ]+ )?:([A-Za-z0-9_]+)![^ ]+ PRIVMSG "
+        r"#([A-Za-z0-9_]+) :(.*)$"
+    )
+    _JOIN = re.compile(
+        r"^(?:@[^ ]+ )?:[A-Za-z0-9_]+![^ ]+ JOIN #([A-Za-z0-9_]+)$"
+    )
 
     def __init__(self, username, oauth, verbose=False):
-        """Create a new stream object, and try to connect."""
-        self.username = username
-        self.oauth = oauth
+        self.username = username.lower()
+        self.oauth = oauth if oauth.startswith("oauth:") else "oauth:" + oauth
         self.verbose = verbose
-        self.current_channel = ""
-        self.last_sent_time = time.time()
+        self.current_channel = self.username
+        self.last_sent_time = 0.0
         self.buffer = []
         self.s = None
+        self._partial = ""
 
     def __enter__(self):
         self.connect()
         return self
 
-    def __exit__(self, type, value, traceback):
-        self.s.close()
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def close(self):
+        if self.s is not None:
+            try:
+                self.s.close()
+            finally:
+                self.s = None
 
     @staticmethod
     def _logged_in_successful(data):
-        """
-        Test the login status from the returned communication of the
-        server.
-
-        :param data: bytes received from server during login
-        :type data: list of bytes
-
-        :return boolean, True when you are logged in.
-        """
-        if re.match(r'^:(testserver\.local|tmi\.twitch\.tv)'
-                    r' NOTICE \* :'
-                    r'(Login unsuccessful|Error logging in)*$',
-                    data.strip()):
-            return False
-        else:
-            return True
+        return not bool(re.search(
+            r"Login (?:authentication failed|unsuccessful)|"
+            r"Error logging in|Improperly formatted auth",
+            data, re.IGNORECASE
+        ))
 
     @staticmethod
     def _check_has_ping(data):
-        """
-        Check if the data from the server contains a request to ping.
-
-        :param data: the byte string from the server
-        :type data: list of bytes
-        :return: True when there is a request to ping, False otherwise
-        """
-        return re.match(
-            r'^PING :tmi\.twitch\.tv$', data)
+        return data.startswith("PING ")
 
     @staticmethod
     def _check_has_channel(data):
-        """
-        Check if the data from the server contains a channel switch.
-
-        :param data: the byte string from the server
-        :type data: list of bytes
-        :return: Name of channel when new channel, False otherwise
-        """
-        return re.findall(
-            r'^:[a-zA-Z0-9_]+\![a-zA-Z0-9_]+@[a-zA-Z0-9_]+'
-            r'\.tmi\.twitch\.tv '
-            r'JOIN #([a-zA-Z0-9_]+)$', data)
+        match = TwitchChatStream._JOIN.match(data)
+        return [match.group(1)] if match else []
 
     @staticmethod
     def _check_has_message(data):
-        """
-        Check if the data from the server contains a message a user
-        typed in the chat.
-
-        :param data: the byte string from the server
-        :type data: list of bytes
-        :return: returns iterator over these messages
-        """
-        return re.match(r'^:[a-zA-Z0-9_]+\![a-zA-Z0-9_]+@[a-zA-Z0-9_]+'
-                        r'\.tmi\.twitch\.tv '
-                        r'PRIVMSG #[a-zA-Z0-9_]+ :.+$', data)
+        return TwitchChatStream._MESSAGE.match(data)
 
     def connect(self):
-        """
-        Connect to Twitch
-        """
-
-        # Do not use non-blocking stream, they are not reliably
-        # non-blocking
-        # s.setblocking(False)
-        # s.settimeout(1.0)
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        connect_host = "irc.twitch.tv"
-        connect_port = 6667
+        """Connect over TLS, authenticate and join the selected channel."""
+        self.close()
+        raw = socket.create_connection((self.HOST, self.PORT), timeout=10)
         try:
-            s.connect((connect_host, connect_port))
-        except (Exception, IOError):
-            print("Unable to create a socket to %s:%s" % (
-                connect_host,
-                connect_port))
-            raise  # unexpected, because it is a blocking socket
-
-        # Connected to twitch
-        # Sending our details to twitch...
-        s.send(('PASS %s\r\n' % self.oauth).encode('utf-8'))
-        s.send(('NICK %s\r\n' % self.username).encode('utf-8'))
-        if self.verbose:
-            print('PASS %s\r\n' % self.oauth)
-            print('NICK %s\r\n' % self.username)
-
-        received = s.recv(1024).decode()
-        if self.verbose:
-            print(received)
-        if not TwitchChatStream._logged_in_successful(received):
-            # ... and they didn't accept our details
-            raise IOError("Twitch did not accept the username-oauth "
-                          "combination")
-        else:
-            # ... and they accepted our details
-            # Connected to twitch.tv!
-            # now make this socket non-blocking on the OS-level
-            fcntl.fcntl(s, fcntl.F_SETFL, os.O_NONBLOCK)
+            conn = ssl.create_default_context().wrap_socket(
+                raw, server_hostname=self.HOST
+            )
+            conn.settimeout(10)
+            conn.sendall(("PASS %s\r\n" % self.oauth).encode("utf-8"))
+            conn.sendall(("NICK %s\r\n" % self.username).encode("utf-8"))
+            conn.sendall(
+                b"CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n"
+            )
+            self.s = conn
+            self._partial = ""
+            self.join_channel(self.current_channel)
+            conn.setblocking(False)
+        except Exception:
             if self.s is not None:
-                self.s.close()  # close the previous socket
-            self.s = s          # store the new socket
-            self.join_channel(self.username)
-
-            # Wait until we have switched channels
-            while self.current_channel != self.username:
-                self.twitch_receive_messages()
+                self.close()
+            else:
+                raw.close()
+            raise
 
     def _push_from_buffer(self):
-        """
-        Push a message on the stack to the IRC stream.
-        This is necessary to avoid Twitch overflow control.
-        """
-        if len(self.buffer) > 0:
-            if time.time() - self.last_sent_time > 5:
+        """Send queued chat without exceeding ordinary Twitch rate limits."""
+        if self.buffer and self.s is not None:
+            now = time.monotonic()
+            if now - self.last_sent_time >= 2.0:
+                message = self.buffer[0]
                 try:
-                    message = self.buffer.pop(0)
-                    self.s.send(message.encode('utf-8'))
-                    if self.verbose:
-                        print(message)
-                finally:
-                    self.last_sent_time = time.time()
+                    self.s.sendall((message + "\r\n").encode("utf-8"))
+                except (BlockingIOError, ssl.SSLWantWriteError):
+                    return
+                self.buffer.pop(0)
+                self.last_sent_time = now
+                if self.verbose:
+                    print(message)
 
     def _send(self, message):
-        """
-        Send a message to the IRC stream
+        if message:
+            self.buffer.append(message.replace("\r", " ").replace("\n", " "))
 
-        :param message: the message to be sent.
-        :type message: string
-        """
-        if len(message) > 0:
-            self.buffer.append(message + "\n")
-
-    def _send_pong(self):
-        """
-        Send a pong message, usually in reply to a received ping message
-        """
-        self._send("PONG")
+    def _send_pong(self, payload=":tmi.twitch.tv"):
+        # PONG is never rate-limited or queued, or Twitch may disconnect.
+        if self.s is not None:
+            self.s.sendall(("PONG " + payload + "\r\n").encode("utf-8"))
 
     def join_channel(self, channel):
-        """
-        Join a different chat channel on Twitch.
-        Note, this function returns immediately, but the switch might
-        take a moment
-
-        :param channel: name of the channel (without #)
-        """
-        self.s.send(('JOIN #%s\r\n' % channel).encode('utf-8'))
-        if self.verbose:
-            print('JOIN #%s\r\n' % channel)
+        """Join a channel. Messages are now sent to that channel."""
+        channel = channel.lstrip("#").lower()
+        if not re.fullmatch(r"[a-z0-9_]+", channel):
+            raise ValueError("Invalid Twitch channel")
+        self.current_channel = channel
+        if self.s is not None:
+            self.s.sendall(("JOIN #%s\r\n" % channel).encode("utf-8"))
 
     def send_chat_message(self, message):
-        """
-        Send a chat message to the server.
-
-        :param message: String to send (don't use \\n)
-        """
-        self._send("PRIVMSG #{0} :{1}".format(self.username, message))
+        """Queue a message for the selected channel."""
+        self._send("PRIVMSG #{0} :{1}".format(self.current_channel, message))
 
     def _parse_message(self, data):
-        """
-        Parse the bytes received from the socket.
-
-        :param data: the bytes received from the socket
-        :return:
-        """
-        if TwitchChatStream._check_has_ping(data):
-            self._send_pong()
-        if TwitchChatStream._check_has_channel(data):
-            self.current_channel = \
-                TwitchChatStream._check_has_channel(data)[0]
-
-        if TwitchChatStream._check_has_message(data):
-            return {
-                'channel': re.findall(r'^:.+![a-zA-Z0-9_]+'
-                                      r'@[a-zA-Z0-9_]+'
-                                      r'.+ '
-                                      r'PRIVMSG (.*?) :',
-                                      data)[0],
-                'username': re.findall(r'^:([a-zA-Z0-9_]+)!', data)[0],
-                'message': re.findall(r'PRIVMSG #[a-zA-Z0-9_]+ :(.+)',
-                                      data)[0]
-            }
-        else:
+        if self._check_has_ping(data):
+            self._send_pong(data[5:])
             return None
 
-    def twitch_receive_messages(self):
-        """
-        Call this function to process everything received by the socket
-        This needs to be called frequently enough (~10s) Twitch logs off
-        users not replying to ping commands.
+        if not self._logged_in_successful(data):
+            self.close()
+            raise OSError("Twitch rejected the IRC login/token")
 
-        :return: list of chat messages received. Each message is a dict
-            with the keys ['channel', 'username', 'message']
-        """
+        channels = self._check_has_channel(data)
+        if channels:
+            self.current_channel = channels[0].lower()
+
+        match = self._check_has_message(data)
+        if match:
+            return {
+                "channel": "#" + match.group(2),
+                "username": match.group(1),
+                "message": match.group(3),
+            }
+        return None
+
+    def twitch_receive_messages(self):
+        """Nonblocking poll of IRC messages; safe with split TCP packets."""
+        if self.s is None:
+            raise RuntimeError("Twitch chat is not connected")
         self._push_from_buffer()
         result = []
         while True:
-            # process the complete buffer, until no data is left no more
             try:
-                msg = self.s.recv(4096).decode()     # NON-BLOCKING RECEIVE!
-            except socket.error as e:
-                err = e.args[0]
-                if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
-                    # There is no more data available to read
+                chunk = self.s.recv(4096)
+            except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                return result
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     return result
-                else:
-                    # a "real" error occurred
-                    # import traceback
-                    # import sys
-                    # print(traceback.format_exc())
-                    # print("Trying to recover...")
-                    self.connect()
-                    return result
-            else:
+                self.connect()
+                return result
+
+            if not chunk:
+                self.connect()
+                return result
+
+            self._partial += chunk.decode("utf-8", errors="replace")
+            if len(self._partial) > 65536:
+                self._partial = ""
+                raise OSError("Twitch IRC line exceeded maximum length")
+
+            while "\r\n" in self._partial:
+                line, self._partial = self._partial.split("\r\n", 1)
                 if self.verbose:
-                    print(msg)
-                rec = [self._parse_message(line)
-                       for line in filter(None, msg.split('\r\n'))]
-                rec = [r for r in rec if r]     # remove Nones
-                result.extend(rec)
+                    print(line)
+                message = self._parse_message(line)
+                if message is not None:
+                    result.append(message)
