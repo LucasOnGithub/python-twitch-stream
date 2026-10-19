@@ -23,6 +23,38 @@ Its main features are:
   and reading what other users post.
 
 
+Slippi AI Windows compatibility
+-------------------------------
+
+The native Slippi AI Windows launcher uses Python 3.12 and pins
+``numpy==2.5.3``. This library now pins the same NumPy version for Python
+3.12 and newer, while keeping a compatible requirement for Python 3.10/3.11.
+The other runtime dependency, ``requests``, is not pinned in Slippi AI.
+
+To install this library **inside your existing Slippi AI environment**,
+run the following in PowerShell from your local ``slippi-ai_windows`` folder
+(adjust the path to your Twitch repository checkout):
+
+.. code-block:: powershell
+
+  .\.venv-native\Scripts\python.exe -m pip install -e "A:\Downloads\python-twitch-stream"
+  .\.venv-native\Scripts\python.exe -m pip check
+  .\.venv-native\Scripts\python.exe -c "import numpy, requests, twitchstream; print(numpy.__version__, requests.__version__)"
+  .\play.cmd -model gm-v1 -legacy-gpu -verify-only
+
+``pip check`` should say ``No broken requirements found``; the last
+command verifies that the existing GPU model still works without streaming.
+
+For maximum isolation you can instead use a separate Python venv for Twitch
+and communicate with the Slippi bot through local IPC. This avoids changing
+Slippi's ``.venv-native`` at all.
+
+``FFmpeg`` is an external executable, **not** a pip dependency; install it
+separately and place it on ``PATH``. NVIDIA encoding is available using
+``video_codec='h264_nvenc'``, but streaming can still consume some CPU/GPU
+resources. The Twitch library accepts NumPy RGB frames; it does **not**
+capture the Dolphin window by itself.
+
 Installation
 ------------
 
