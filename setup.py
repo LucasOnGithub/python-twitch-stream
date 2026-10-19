@@ -18,9 +18,12 @@ except IOError:
 
 
 
+# Keep the install metadata synchronized with requirements.txt.
+# Slippi AI's Windows native environment uses Python 3.12 + NumPy 2.5.3.
 install_requires = [
-    'numpy>=1.23',
-    'requests>=2.28',
+    'numpy==2.5.3; python_version >= "3.12"',
+    'numpy>=1.23,<2.5; python_version < "3.12"',
+    'requests>=2.28,<3',
     ]
 
 tests_require = [
