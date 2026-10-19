@@ -1,4 +1,10 @@
-numpy>=1.23
-requests>=2.28
+# Align the shared NumPy dependency with slippi-ai_windows/requirements-native-windows.txt.
+# NumPy 2.5.3 requires Python >=3.12 (Slippi's native launcher uses Python 3.12).
+numpy==2.5.3; python_version >= "3.12"
+# Preserve Python 3.10/3.11 compatibility for standalone Twitch library users.
+numpy>=1.23,<2.5; python_version < "3.12"
+# requests is Twitch-only; the Slippi AI native launcher does not pin it.
+requests>=2.28,<3
+# Testing dependencies (not needed when pip installing the Twitch package with -e).
 pytest>=7
 pytest-cov>=4
