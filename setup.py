@@ -16,8 +16,6 @@ try:
 except IOError:
     README = CHANGES = ''
 
-
-
 # Keep the install metadata synchronized with requirements.txt.
 # Slippi AI's Windows native environment uses Python 3.12 + NumPy 2.5.3.
 install_requires = [
